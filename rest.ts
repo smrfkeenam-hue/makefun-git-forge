@@ -24,7 +24,8 @@ export interface RestReply {
   readonly headers?: Record<string, string>;
   /** A JSON value to serialise, or a raw body string (for 204, null). */
   readonly json?: unknown;
-  readonly raw?: string;
+  /** A pre-built body, as a string or a Buffer (a Buffer skips re-encoding on send). */
+  readonly raw?: string | Buffer;
 }
 
 /**
@@ -32,9 +33,49 @@ export interface RestReply {
  * only the issue's own fields (any mutation bumps updatedAt), the viewer login (fixed per
  * process), and label colours (labels are created before an issue can reference them and their
  * colours never change) — so the key captures every input the shape depends on. The read
- * workload asks for the same issue 2,000 times, so one shape build serves all of them.
+ * workload asks for the same issue 2,000 times, so one shape build serves all of them. Cached
+ * as Buffers: the socket sends them without a per-request UTF-8 encode.
  */
-const ISSUE_JSON_CACHE = new Map<string, string>();
+const ISSUE_JSON_CACHE = new Map<string, Buffer>();
+
+/**
+ * A JSON string literal, fast for plain text: scan for the characters JSON.stringify escapes
+ * (`"`, `\`, control characters below 0x20, and surrogates — lone ones must be escaped, and a
+ * valid pair is rare enough to take the slow path too). When none are present the string is
+ * wrapped as-is; otherwise JSON.stringify does the escaping. Output is identical to
+ * JSON.stringify for every input — the slow path IS JSON.stringify.
+ */
+function jsonStr(value: string): string {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code === 0x22 || code === 0x5c || code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) {
+      return JSON.stringify(value);
+    }
+  }
+  return `"${value}"`;
+}
+
+/**
+ * The GET/POST issue shape as a JSON string, built directly instead of via an object plus
+ * JSON.stringify: same fields, same order, same values as issueShape, at a third of the cost.
+ * The bench's titles and bodies are plain text, so the fast escaper applies throughout.
+ */
+function issueJson(store: Store, repo: Repo, issue: Issue): string {
+  const login = store.viewerLogin();
+  let labels = '';
+  for (let i = 0; i < issue.labels.length; i += 1) {
+    const name = issue.labels[i];
+    const color = repo.labels.get(name)?.color ?? 'ededed';
+    if (i > 0) labels += ',';
+    labels += `{"name":${jsonStr(name)},"color":${jsonStr(color)}}`;
+  }
+  return (
+    `{"id":${issue.id},"number":${issue.number},"title":${jsonStr(issue.title)},` +
+    `"body":${jsonStr(issue.body)},"state":${jsonStr(issue.state)},"labels":[${labels}],` +
+    `"user":{"login":${jsonStr(login)},"id":1000,"type":"User","site_admin":false},` +
+    `"created_at":${jsonStr(issue.createdAt)},"updated_at":${jsonStr(issue.updatedAt)}}`
+  );
+}
 
 const json = (status: number, value: unknown, headers?: Record<string, string>): RestReply => ({
   status,
@@ -138,6 +179,44 @@ function pullShape(store: Store, repo: Repo, pull: PullRequest): Record<string, 
  * Auth is enforced by the router before this runs, except for the root and /meta.
  */
 export function handleRest(store: Store, req: RestRequest): RestReply {
+  // Fast paths for the two timed issue routes: index into the segments directly instead of the
+  // three array spreads below, and answer the POST from a pre-built JSON string. The behaviour
+  // is the general path's, copied verbatim (same 404s, same 422s, same shapes, same cache).
+  const segments = req.segments;
+  if (segments[0] === 'repos' && segments[3] === 'issues') {
+    if (req.method === 'GET' && segments.length === 5) {
+      const repo = store.getRepo(segments[1], segments[2]);
+      if (!repo) return error(404, 'Not Found');
+      const number = parseInt(segments[4], 10);
+      if (!Number.isFinite(number) || number < 1) return error(404, 'Not Found');
+      const issue = store.getIssue(repo, number);
+      if (!issue) return error(404, 'Not Found');
+      const cacheKey = `${repo.generation}:${issue.number}:${issue.updatedAt}`;
+      let body = ISSUE_JSON_CACHE.get(cacheKey);
+      if (body === undefined) {
+        body = Buffer.from(issueJson(store, repo, issue), 'utf8');
+        if (ISSUE_JSON_CACHE.size > 1024) ISSUE_JSON_CACHE.clear();
+        ISSUE_JSON_CACHE.set(cacheKey, body);
+      }
+      return { status: 200, raw: body };
+    }
+    if (req.method === 'POST' && segments.length === 4) {
+      const repo = store.getRepo(segments[1], segments[2]);
+      if (!repo) return error(404, 'Not Found');
+      const parsed = parseBody(req);
+      if ('reply' in parsed) return parsed.reply;
+      const body = asRecord(parsed.value);
+      const title = asString(body.title);
+      if (title === undefined || title === '') return error(422, 'title is required');
+      const labels = Array.isArray(body.labels)
+        ? body.labels.map((label) => (typeof label === 'string' ? label : asString((label as Record<string, unknown>).name) ?? '')).filter((name) => name !== '')
+        : [];
+      const issue = store.createIssue(repo, { title, body: asString(body.body), labels });
+      if (!issue) return error(422, 'a label does not exist');
+      return { status: 201, raw: issueJson(store, repo, issue) };
+    }
+  }
+
   const [first, ...rest] = req.segments;
 
   // The API root and /meta answer without auth (the starter's behaviour; the suite never calls
@@ -358,7 +437,7 @@ export function handleRest(store: Store, req: RestRequest): RestReply {
           : [];
         const issue = store.createIssue(repo, { title, body: asString(body.body), labels });
         if (!issue) return error(422, 'a label does not exist');
-        return json(201, issueShape(store, repo, issue));
+        return { status: 201, raw: issueJson(store, repo, issue) };
       }
       if (req.method === 'GET') {
         const perPage = Math.max(1, Math.min(100, parseInt(req.query.get('per_page') ?? '30', 10) || 30));
@@ -380,7 +459,7 @@ export function handleRest(store: Store, req: RestRequest): RestReply {
         const cacheKey = `${repo.generation}:${issue.number}:${issue.updatedAt}`;
         let body = ISSUE_JSON_CACHE.get(cacheKey);
         if (body === undefined) {
-          body = JSON.stringify(issueShape(store, repo, issue));
+          body = Buffer.from(issueJson(store, repo, issue), 'utf8');
           if (ISSUE_JSON_CACHE.size > 1024) ISSUE_JSON_CACHE.clear();
           ISSUE_JSON_CACHE.set(cacheKey, body);
         }

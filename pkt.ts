@@ -29,8 +29,11 @@ export type Packet =
 export function pktLine(payload: Buffer | string): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   if (data.length > PKT_MAX_PAYLOAD) throw new Error(`pkt-line payload of ${data.length} bytes exceeds ${PKT_MAX_PAYLOAD}`);
-  const header = (data.length + 4).toString(16).padStart(4, '0');
-  return Buffer.concat([Buffer.from(header, 'ascii'), data]);
+  // One allocation: the 4-byte hex header plus the payload, no intermediate buffers.
+  const out = Buffer.alloc(4 + data.length);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
 
 /** Encode several payloads, each its own pkt-line, concatenated. */
@@ -51,12 +54,24 @@ export function decodePktLines(
   let offset = 0;
   while (offset < bytes.length) {
     if (offset + 4 > bytes.length) throw new Error('pktline-truncated: short header at end of buffer');
-    const header = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-f]{4}$/.test(header)) {
-      if (options.allowTrailing) break;
-      throw new Error(`pktline-header: bad length ${JSON.stringify(header)}`);
+    // A valid header is four lowercase hex digits: check the bytes directly and accumulate the
+    // length in the same pass (no string, no regex, no parseInt). The error message still names
+    // the header, built only on the throwing path.
+    let length = 0;
+    let valid = true;
+    for (let i = 0; i < 4; i += 1) {
+      const byte = bytes[offset + i];
+      const digit = byte >= 48 && byte <= 57 ? byte - 48 : byte >= 97 && byte <= 102 ? byte - 87 : -1;
+      if (digit === -1) {
+        valid = false;
+        break;
+      }
+      length = length * 16 + digit;
     }
-    const length = parseInt(header, 16);
+    if (!valid) {
+      if (options.allowTrailing) break;
+      throw new Error(`pktline-header: bad length ${JSON.stringify(bytes.subarray(offset, offset + 4).toString('ascii'))}`);
+    }
     if (length === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -75,10 +90,13 @@ export function decodePktLines(
     if (length === 3) throw new Error('pktline-header: length 0003 is not a packet');
     if (length > PKT_LINE_MAX) throw new Error(`pktline-too-long: ${length} bytes`);
     if (offset + length > bytes.length) throw new Error('pktline-truncated: packet overruns the buffer');
-    packets.push({ kind: 'data', payload: Buffer.from(bytes.subarray(offset + 4, offset + length)) });
+    // A view, not a copy: no caller mutates a payload (they only read it as UTF-8).
+    packets.push({ kind: 'data', payload: bytes.subarray(offset + 4, offset + length) });
     offset += length;
   }
-  const trailing = Buffer.from(bytes.subarray(offset));
+  // A view, not a copy: the only allowTrailing caller (receive-pack) hands it to readPack,
+  // which only reads. Without allowTrailing a non-empty tail throws below.
+  const trailing = bytes.subarray(offset);
   if (!options.allowTrailing && trailing.length > 0) throw new Error('pktline-after-end: trailing bytes after the packets');
   return { packets, trailing };
 }

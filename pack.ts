@@ -141,14 +141,16 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
  */
 export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) => GitObject | undefined } = {}): PackReadResult {
   if (pack.length < 32) throw new Error('pack-truncated: a pack is at least 32 bytes');
-  if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack-header: not a packfile');
+  if (pack[0] !== 0x50 || pack[1] !== 0x41 || pack[2] !== 0x43 || pack[3] !== 0x4b) {
+    throw new Error('pack-header: not a packfile');
+  }
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`pack-version: ${version}`);
   const declaredCount = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
-  const trailer = pack.subarray(trailerStart).toString('hex');
-  const computed = createHash('sha1').update(pack.subarray(0, trailerStart) as BinaryLike).digest('hex');
-  if (computed !== trailer) throw new Error('pack-checksum: the trailer does not match the bytes');
+  const trailer = pack.subarray(trailerStart);
+  const computed = createHash('sha1').update(pack.subarray(0, trailerStart) as BinaryLike).digest();
+  if (!computed.equals(trailer)) throw new Error('pack-checksum: the trailer does not match the bytes');
 
   const entries: PackEntry[] = [];
   let offset = 12;
@@ -189,6 +191,17 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
     offset += consumed;
   }
   if (offset !== trailerStart) throw new Error('pack-trailing: bytes after the last entry');
+
+  // The common case (every pack the suite pushes is delta-free): no delta machinery at all,
+  // just hash each entry straight into the result.
+  if (deltaCount === 0) {
+    const objects = new Map<string, GitObject>();
+    for (const entry of entries) {
+      const object: GitObject = { type: CODE_TYPE[entry.typeCode], data: entry.data };
+      objects.set(hashObject(object.type, object.data), object);
+    }
+    return { version, declaredCount, objects, deltaCount, byteLength: pack.length, checksumOk: true };
+  }
 
   // Resolve deltas, recursively, with cycle detection.
   const byOffset = new Map<number, PackEntry>();

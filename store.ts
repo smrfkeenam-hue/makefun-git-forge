@@ -29,6 +29,9 @@ import {
 /** The default branch every repository is born with. */
 export const DEFAULT_BRANCH = 'main';
 
+/** The empty tree's id, hashed once: every repository is born with it. */
+const EMPTY_TREE_OID = hashObject('tree', Buffer.alloc(0));
+
 /**
  * The viewer login: the token's owner. The suite's scenario is one fixed seed (wire.ts
  * SCENARIO_SEED, buildScenario() taking no trial input), so the viewer is `adaiversen` in every
@@ -177,7 +180,7 @@ export class Store {
     };
     // The empty tree, so an unborn repository's first commit has a tree to build on.
     const emptyTree = Buffer.alloc(0);
-    repo.objects.set(hashObject('tree', emptyTree), { type: 'tree', data: emptyTree });
+    repo.objects.set(EMPTY_TREE_OID, { type: 'tree', data: emptyTree });
     this.repos.set(name, repo);
     return repo;
   }
@@ -211,6 +214,14 @@ export class Store {
     const oid = hashObject(type, data);
     if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
     return oid;
+  }
+
+  /**
+   * Store an object whose id is already known (a pack reader hashed it once already):
+   * the same store-once behaviour as putObject without hashing the bytes a second time.
+   */
+  putObjectKnownOid(repo: Repo, oid: string, type: GitObjectType, data: Buffer): void {
+    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
   }
 
   /** Fetch an object, or undefined when absent. */
@@ -266,7 +277,7 @@ export class Store {
 
   /** The empty tree's id (the same in every repository). */
   emptyTreeOid(): string {
-    return hashObject('tree', Buffer.alloc(0));
+    return EMPTY_TREE_OID;
   }
 
   /**

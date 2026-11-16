@@ -16,20 +16,42 @@ export interface GitObject {
 /** The all-zero object id: an unborn ref, a delete, a missing parent. */
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 
-/** True when the string is a lowercase 40-hex object id. */
+/** True when the string is a lowercase 40-hex object id (a manual scan: the regex is hot). */
 export function isObjectId(value: string): boolean {
-  return /^[0-9a-f]{40}$/.test(value);
+  if (value.length !== 40) return false;
+  for (let i = 0; i < 40; i += 1) {
+    const code = value.charCodeAt(i);
+    if (!((code >= 48 && code <= 57) || (code >= 97 && code <= 102))) return false;
+  }
+  return true;
 }
 
 /** The SHA-1 of "<type> <len>\0" + data, as lowercase hex. */
+/** The object header (`"<type> <length>\0"`) for a (type, length) pair, cached: the bench hashes the
+ * same shapes over and over (a 1 KiB blob, a small tree, a small commit), so the header Buffer is
+ * built once per shape instead of once per hash. The header is only ever fed to a hash update,
+ * which never mutates it, so sharing one Buffer per shape is safe. Bounded like the other caches. */
+const HEADER_CACHE = new Map<string, Buffer>();
+
+/** The cached header Buffer for one object shape. */
+function headerFor(type: GitObjectType, length: number): Buffer {
+  const key = `${type} ${length}`;
+  let header = HEADER_CACHE.get(key);
+  if (header === undefined) {
+    header = Buffer.from(`${type} ${length}\0`, 'ascii');
+    if (HEADER_CACHE.size > 1024) HEADER_CACHE.clear();
+    HEADER_CACHE.set(key, header);
+  }
+  return header;
+}
+
 export function hashObject(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return createHash('sha1').update(header).update(data).digest('hex');
+  return createHash('sha1').update(headerFor(type, data.length)).update(data).digest('hex');
 }
 
 /** The loose-object bytes: header + content (used only to verify a hash, never written to disk). */
 export function encodeLooseObject(type: GitObjectType, data: Buffer): Buffer {
-  return Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'ascii'), data]);
+  return Buffer.concat([headerFor(type, data.length), data]);
 }
 
 // --------------------------------------------------------------------------- trees
@@ -219,9 +241,39 @@ export function collectReachable(
   return seen;
 }
 
+/**
+ * A commit's parent ids, read straight from its bytes: the parent lines sit right after the
+ * tree line, so a byte scan finds them without a full parse. Returns null for any shape that
+ * is not exactly "tree <oid>\n" followed by "parent <oid>\n" lines — the caller then falls
+ * back to the full parse, so a weird-but-valid commit behaves exactly as before.
+ */
+function commitParentOids(data: Buffer): string[] | null {
+  if (data.length < 46 || data.subarray(0, 5).toString('ascii') !== 'tree ' || data[45] !== 0x0a) return null;
+  if (!isObjectId(data.subarray(5, 45).toString('ascii'))) return null;
+  const parents: string[] = [];
+  let lineStart = 46;
+  while (lineStart < data.length) {
+    if (data[lineStart] === 0x0a) break; // the blank line: the message follows
+    if (data.subarray(lineStart, lineStart + 7).toString('ascii') !== 'parent ') break;
+    if (lineStart + 47 >= data.length) return null;
+    const oid = data.subarray(lineStart + 7, lineStart + 47).toString('ascii');
+    if (!isObjectId(oid)) return null;
+    parents.push(oid);
+    lineStart += 48; // "parent " + 40 hex + "\n"
+  }
+  return parents;
+}
+
 /** True when `ancestor` is reachable from `tip` (or equals it) — the fast-forward test. */
 export function isAncestor(ancestor: string, tip: string, lookup: ObjectLookup): boolean {
   if (ancestor === tip) return true;
+  // Fast path: a push's new tip almost always has the old tip as its immediate parent. Only
+  // a confirmed immediate parent answers here; every other case falls through to the walk.
+  const tipObject = lookup(tip);
+  if (tipObject?.type === 'commit') {
+    const parents = commitParentOids(tipObject.data);
+    if (parents !== null && parents.includes(ancestor)) return true;
+  }
   const seen = new Set<string>();
   const stack = [tip];
   while (stack.length > 0) {

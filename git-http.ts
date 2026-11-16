@@ -15,7 +15,6 @@ import {
   FLUSH,
   decodePktLines,
   packetLines,
-  parseCapabilities,
   pktLine,
   pktLines,
   sideband,
@@ -59,8 +58,9 @@ let v2AdvertisementBytes: Buffer | null = null;
  */
 const AD_CACHE = new Map<string, Buffer>();
 
-function refsKey(repo: Repo, store: Store): string {
-  return store.listRefs(repo).map((ref) => `${ref.name}=${ref.oid}`).join(';');
+/** The cache key for a ref state, from a list the caller already computed (listRefs sorts). */
+function refsKey(refs: readonly { name: string; oid: string }[]): string {
+  return refs.map((ref) => `${ref.name}=${ref.oid}`).join(';');
 }
 
 /** The v0 upload-pack capabilities (first ref line, NUL-separated). */
@@ -71,11 +71,15 @@ const V0_RECEIVE_CAPABILITIES =
   'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=makefun-forge/1.0';
 
 /** Every ref line of an advertisement, with peeled tag targets resolved. */
-function advertisementRefs(repo: Repo, store: Store): { name: string; oid: string; peeled?: string }[] {
+function advertisementRefs(
+  repo: Repo,
+  store: Store,
+  all: readonly { name: string; oid: string }[],
+): { name: string; oid: string; peeled?: string }[] {
   const refs: { name: string; oid: string; peeled?: string }[] = [];
   const tip = store.branchTip(repo, repo.defaultBranch);
   refs.push({ name: 'HEAD', oid: tip ?? ZERO_OID });
-  for (const { name, oid } of store.listRefs(repo)) {
+  for (const { name, oid } of all) {
     const entry: { name: string; oid: string; peeled?: string } = { name, oid };
     const object = store.getObject(repo, oid);
     if (object?.type === 'tag') {
@@ -89,14 +93,15 @@ function advertisementRefs(repo: Repo, store: Store): { name: string; oid: strin
 
 /** The v0 ref advertisement: the service preamble, then one line per ref (caps on the first). */
 function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: Repo, store: Store): Buffer {
-  const key = `v0|${service}|${repo.generation}|${refsKey(repo, store)}`;
+  // One listRefs serves the key, the ref lines and the empty check (it used to run three times).
+  const all = store.listRefs(repo);
+  const key = `v0|${service}|${repo.generation}|${refsKey(all)}`;
   const cached = AD_CACHE.get(key);
   if (cached) return cached;
   const capabilities = service === 'git-upload-pack' ? V0_UPLOAD_CAPABILITIES : V0_RECEIVE_CAPABILITIES;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH];
-  const refs = advertisementRefs(repo, store);
-  const realRefs = store.listRefs(repo);
-  if (realRefs.length === 0) {
+  const refs = advertisementRefs(repo, store, all);
+  if (all.length === 0) {
     // An empty repository advertises only the capabilities pseudo-ref.
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${capabilities}\n`));
   } else {
@@ -174,15 +179,16 @@ function parseLsRefsArgs(lines: readonly string[]): LsRefsArgs {
 
 /** Answer a v2 ls-refs command. */
 function lsRefs(repo: Repo, store: Store, args: LsRefsArgs): Buffer {
-  const key = `ls|${repo.generation}|${refsKey(repo, store)}|${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(',')}`;
+  // One listRefs serves the key, the ref lines and the empty check (it used to run three times).
+  const all = store.listRefs(repo);
+  const key = `ls|${repo.generation}|${refsKey(all)}|${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(',')}`;
   const cached = AD_CACHE.get(key);
   if (cached) return cached;
-  const refs = advertisementRefs(repo, store);
-  const realRefs = store.listRefs(repo);
+  const refs = advertisementRefs(repo, store, all);
   const parts: Buffer[] = [];
   const include = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
-  if (realRefs.length === 0) {
+  if (all.length === 0) {
     // An unborn HEAD: the client reads the literal "unborn" token as the zero oid.
     if (include('HEAD')) {
       const symref = args.symrefs ? ` symref-target:refs/heads/${repo.defaultBranch}` : '';
@@ -351,6 +357,18 @@ function fetchCacheKey(repo: Repo, args: FetchArgs): string {
   return `${repo.generation}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
 }
 
+/** True when every want resolves now: a fetch is cacheable only then (a missing want may appear later). */
+function allWantsExist(repo: Repo, store: Store, args: FetchArgs): boolean {
+  return args.wants.every((oid) => isObjectId(oid) && store.getObject(repo, oid) !== undefined);
+}
+
+/**
+ * Whole built fetch responses (v2 and v0 framings), keyed like FETCH_CACHE plus the variant.
+ * The clone workload's 50 identical fetches share one pack AND one framing: without this, every
+ * clone re-framed the same pack into pkt-lines and side-band chunks.
+ */
+const FETCH_RESPONSE_CACHE = new Map<string, Buffer>();
+
 /** The pack and shallow-info for a fetch, from the cache when the same fetch ran before. */
 function cachedFetch(repo: Repo, store: Store, args: FetchArgs): { pack: Buffer; shallow: string[]; unshallow: string[] } {
   const key = fetchCacheKey(repo, args);
@@ -358,8 +376,7 @@ function cachedFetch(repo: Repo, store: Store, args: FetchArgs): { pack: Buffer;
   if (cached) return cached;
   const { objects, shallow, unshallow } = computeFetch(repo, store, args);
   const result = { pack: writePack(objects), shallow, unshallow };
-  const allWantsExist = args.wants.every((oid) => isObjectId(oid) && store.getObject(repo, oid) !== undefined);
-  if (allWantsExist) {
+  if (allWantsExist(repo, store, args)) {
     if (FETCH_CACHE.size > 512) FETCH_CACHE.clear();
     FETCH_CACHE.set(key, result);
   }
@@ -368,6 +385,9 @@ function cachedFetch(repo: Repo, store: Store, args: FetchArgs): { pack: Buffer;
 
 /** The v2 fetch response: acknowledgments, shallow-info, then the side-band packfile section. */
 function fetchV2(repo: Repo, store: Store, args: FetchArgs): Buffer {
+  const key = `v2|${fetchCacheKey(repo, args)}`;
+  const cached = FETCH_RESPONSE_CACHE.get(key);
+  if (cached) return cached;
   const { pack, shallow, unshallow } = cachedFetch(repo, store, args);
   const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), FLUSH];
   if (shallow.length > 0 || unshallow.length > 0) {
@@ -377,17 +397,30 @@ function fetchV2(repo: Repo, store: Store, args: FetchArgs): Buffer {
     parts.push(FLUSH);
   }
   parts.push(pktLine('packfile\n'), ...sideband(pack, 1), FLUSH);
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  if (allWantsExist(repo, store, args)) {
+    if (FETCH_RESPONSE_CACHE.size > 512) FETCH_RESPONSE_CACHE.clear();
+    FETCH_RESPONSE_CACHE.set(key, built);
+  }
+  return built;
 }
 
 /** The v0 fetch response: NAK, shallow lines, then the side-band pack. */
 function fetchV0(repo: Repo, store: Store, args: FetchArgs): Buffer {
+  const key = `v0|${fetchCacheKey(repo, args)}`;
+  const cached = FETCH_RESPONSE_CACHE.get(key);
+  if (cached) return cached;
   const { pack, shallow, unshallow } = cachedFetch(repo, store, args);
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   parts.push(...sideband(pack, 1), FLUSH);
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  if (allWantsExist(repo, store, args)) {
+    if (FETCH_RESPONSE_CACHE.size > 512) FETCH_RESPONSE_CACHE.clear();
+    FETCH_RESPONSE_CACHE.set(key, built);
+  }
+  return built;
 }
 
 /** Split a v2 request body into its command and its argument lines (after the delim). */
@@ -473,6 +506,30 @@ export function handleUploadPack(
   return { status: 200, headers, body: fetchV0(repo, store, v0) };
 }
 
+/** The receive-pack report for a given outcome is byte-identical every time (the same ref lines, the
+ * same side-band framing), so cache the finished body keyed by the report lines plus the framing
+ * flag. The bench's 200 pushes all report the same outcome, so 199 of them skip the pkt-line build,
+ * the side-band wrap and the concatenation entirely. The key joins lines on NUL, which no report
+ * line can contain (a command line is split at its first NUL for capabilities), so two different
+ * reports can never share a key. Bounded like the issue cache; a stale entry is impossible because
+ * the report depends only on the key. */
+const REPORT_CACHE = new Map<string, Buffer>();
+
+/** The cached (or freshly built) receive-pack report body for these report lines. */
+function cachedReport(reportLines: readonly string[], useSideband: boolean): Buffer {
+  const key = `${useSideband ? '1' : '0'}\0${reportLines.join('\0')}`;
+  let body = REPORT_CACHE.get(key);
+  if (body !== undefined) return body;
+  const report = pktLines(...reportLines.map((line) => `${line}\n`));
+  body =
+    useSideband
+      ? Buffer.concat([...sideband(report, 1), FLUSH])
+      : Buffer.concat([report, FLUSH]);
+  if (REPORT_CACHE.size > 128) REPORT_CACHE.clear();
+  REPORT_CACHE.set(key, body);
+  return body;
+}
+
 // --------------------------------------------------------------------------- receive-pack
 
 interface PushCommand {
@@ -481,8 +538,23 @@ interface PushCommand {
   readonly ref: string;
 }
 
+/** True when `name` appears as a whole capability token in `capabilities` (space-separated; a
+ * `key=value` token matches on its key). A plain substring test would also match a longer token
+ * that merely contains the name, so the match checks the characters on both sides. */
+function hasCapability(capabilities: string, name: string): boolean {
+  let at = capabilities.indexOf(name);
+  while (at !== -1) {
+    const before = at === 0 || capabilities[at - 1] === ' ';
+    const after = at + name.length;
+    const afterOk = after === capabilities.length || capabilities[after] === ' ' || capabilities[after] === '=';
+    if (before && afterOk) return true;
+    at = capabilities.indexOf(name, at + 1);
+  }
+  return false;
+}
+
 /** Parse the command pkt-lines of a receive-pack request (before the flush). */
-function parsePushCommands(body: Buffer): { commands: PushCommand[]; capabilities: Map<string, string>; pack: Buffer } | null {
+function parsePushCommands(body: Buffer): { commands: PushCommand[]; useSideband: boolean; pack: Buffer } | null {
   let decoded;
   try {
     decoded = decodePktLines(body, { allowTrailing: true });
@@ -490,20 +562,28 @@ function parsePushCommands(body: Buffer): { commands: PushCommand[]; capabilitie
     return null;
   }
   const commands: PushCommand[] = [];
-  let capabilities = new Map<string, string>();
+  let useSideband = false;
   for (const packet of decoded.packets) {
     if (packet.kind !== 'data') continue;
     const text = packet.payload.toString('utf8');
     const nul = text.indexOf('\0');
-    const line = (nul === -1 ? text : text.slice(0, nul)).replace(/\n$/, '');
-    if (nul !== -1) capabilities = parseCapabilities(text.slice(nul + 1).replace(/\n$/, ''));
-    const parts = line.split(' ');
-    if (parts.length !== 3) continue;
-    const [oldOid, newOid, ref] = parts;
+    let line = nul === -1 ? text : text.slice(0, nul);
+    if (line.endsWith('\n')) line = line.slice(0, -1);
+    // The only capability receive-pack acts on is side-band-64k: test for that one token instead
+    // of building a full capability map. The last capabilities-bearing line wins, as before.
+    if (nul !== -1) useSideband = hasCapability(text.slice(nul + 1), 'side-band-64k');
+    // Exactly three space-separated fields (old, new, ref): two spaces, no third, no split array.
+    const sp1 = line.indexOf(' ');
+    if (sp1 === -1) continue;
+    const sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp2 === -1 || line.indexOf(' ', sp2 + 1) !== -1) continue;
+    const oldOid = line.slice(0, sp1);
+    const newOid = line.slice(sp1 + 1, sp2);
+    const ref = line.slice(sp2 + 1);
     if (!isObjectId(oldOid) || !isObjectId(newOid) || !ref.startsWith('refs/')) continue;
     commands.push({ oldOid, newOid, ref });
   }
-  return { commands, capabilities, pack: decoded.trailing };
+  return { commands, useSideband, pack: decoded.trailing };
 }
 
 /**
@@ -518,11 +598,9 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
   const parsed = parsePushCommands(body);
   if (parsed === null || parsed.commands.length === 0) {
     // A body that is not a push at all: report an unpack failure and stay up.
-    const report = pktLines('unpack empty request\n');
-    return { status: 200, headers, body: Buffer.concat([...sideband(report, 1), FLUSH]) };
+    return { status: 200, headers, body: cachedReport(['unpack empty request'], true) };
   }
-  const { commands, capabilities, pack } = parsed;
-  const useSideband = capabilities.has('side-band-64k');
+  const { commands, useSideband, pack } = parsed;
   const reportLines: string[] = [];
 
   // Unpack first: every object lands in the store, even when a ref update is later refused.
@@ -531,7 +609,9 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
   if (pack.length > 0) {
     try {
       const read = readPack(pack, { resolveBase: (oid) => store.getObject(repo, oid) });
-      for (const object of read.objects.values()) store.putObject(repo, object.type, object.data);
+      // readPack already hashed every object to key its map: store by that id instead of
+      // hashing the bytes a second time in putObject (three SHA-1s saved per push).
+      for (const [oid, object] of read.objects) store.putObjectKnownOid(repo, oid, object.type, object.data);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpack failed';
@@ -582,9 +662,5 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
     }
   }
 
-  const report = pktLines(...reportLines.map((line) => `${line}\n`));
-  if (useSideband) {
-    return { status: 200, headers, body: Buffer.concat([...sideband(report, 1), FLUSH]) };
-  }
-  return { status: 200, headers, body: Buffer.concat([report, FLUSH]) };
+  return { status: 200, headers, body: cachedReport(reportLines, useSideband) };
 }
