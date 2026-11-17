@@ -13,6 +13,7 @@ import { readPack, writePack } from './pack.ts';
 import {
   DELIM,
   FLUSH,
+  PKT_LINE_MAX,
   decodePktLines,
   packetLines,
   pktLine,
@@ -515,16 +516,43 @@ export function handleUploadPack(
  * the report depends only on the key. */
 const REPORT_CACHE = new Map<string, Buffer>();
 
+/** The two-line fast path: one report line per level, so the common "unpack ok" + "ok <ref>"
+ * report needs no joined key string at all — the lines themselves are the keys. One map per
+ * framing flag, so the flag needs no key character either. */
+const REPORT_CACHE_2_SB = new Map<string, Map<string, Buffer>>();
+const REPORT_CACHE_2_PLAIN = new Map<string, Map<string, Buffer>>();
+
+/** Build a report body from its lines (the uncached path, shared by both cache shapes). */
+function buildReport(reportLines: readonly string[], useSideband: boolean): Buffer {
+  const report = pktLines(...reportLines.map((line) => `${line}\n`));
+  return useSideband
+    ? Buffer.concat([...sideband(report, 1), FLUSH])
+    : Buffer.concat([report, FLUSH]);
+}
+
 /** The cached (or freshly built) receive-pack report body for these report lines. */
 function cachedReport(reportLines: readonly string[], useSideband: boolean): Buffer {
+  if (reportLines.length === 2) {
+    const outer = useSideband ? REPORT_CACHE_2_SB : REPORT_CACHE_2_PLAIN;
+    const first = reportLines[0];
+    const second = reportLines[1];
+    let inner = outer.get(first);
+    const body = inner?.get(second);
+    if (body !== undefined) return body;
+    const built = buildReport(reportLines, useSideband);
+    if (inner === undefined) {
+      if (outer.size > 128) outer.clear();
+      inner = new Map();
+      outer.set(first, inner);
+    }
+    if (inner.size > 128) inner.clear();
+    inner.set(second, built);
+    return built;
+  }
   const key = `${useSideband ? '1' : '0'}\0${reportLines.join('\0')}`;
   let body = REPORT_CACHE.get(key);
   if (body !== undefined) return body;
-  const report = pktLines(...reportLines.map((line) => `${line}\n`));
-  body =
-    useSideband
-      ? Buffer.concat([...sideband(report, 1), FLUSH])
-      : Buffer.concat([report, FLUSH]);
+  body = buildReport(reportLines, useSideband);
   if (REPORT_CACHE.size > 128) REPORT_CACHE.clear();
   REPORT_CACHE.set(key, body);
   return body;
@@ -538,52 +566,95 @@ interface PushCommand {
   readonly ref: string;
 }
 
-/** True when `name` appears as a whole capability token in `capabilities` (space-separated; a
- * `key=value` token matches on its key). A plain substring test would also match a longer token
- * that merely contains the name, so the match checks the characters on both sides. */
-function hasCapability(capabilities: string, name: string): boolean {
-  let at = capabilities.indexOf(name);
+/** The side-band-64k token, as bytes, for the capability scan below. */
+const SIDE_BAND_TOKEN = Buffer.from('side-band-64k', 'ascii');
+
+/** True when side-band-64k appears as a whole capability token in `capabilities` (space-separated;
+ * a `key=value` token matches on its key). Byte-level, exactly equivalent to the old string test:
+ * the token is ASCII and UTF-8 multibyte bytes are all >= 0x80, so no token match can span a
+ * multibyte character and no boundary byte (space, '=') can hide inside one. */
+function hasSideBand(capabilities: Buffer): boolean {
+  let at = capabilities.indexOf(SIDE_BAND_TOKEN);
   while (at !== -1) {
-    const before = at === 0 || capabilities[at - 1] === ' ';
-    const after = at + name.length;
-    const afterOk = after === capabilities.length || capabilities[after] === ' ' || capabilities[after] === '=';
+    const before = at === 0 || capabilities[at - 1] === 0x20;
+    const after = at + SIDE_BAND_TOKEN.length;
+    const afterOk = after === capabilities.length || capabilities[after] === 0x20 || capabilities[after] === 0x3d;
     if (before && afterOk) return true;
-    at = capabilities.indexOf(name, at + 1);
+    at = capabilities.indexOf(SIDE_BAND_TOKEN, at + 1);
   }
   return false;
 }
 
-/** Parse the command pkt-lines of a receive-pack request (before the flush). */
+/**
+ * Parse the command pkt-lines of a receive-pack request (before the flush). A dedicated byte
+ * scanner, not decodePktLines: the old path built a packets array, a Packet object per packet and
+ * a UTF-8 string per command line, all to read one line per push. This walks the same pkt-line
+ * framing (the same header checks, the same throws, the same allowTrailing break at the first
+ * non-hex byte — the pack's "PACK" magic) and parses each data packet's command straight from
+ * its bytes: the oids are ASCII slices, the ref is the only UTF-8 decode, and the capability
+ * scan never builds a string. Behaviour is identical by construction: a malformed header still
+ * returns null, a malformed command line is still skipped, and the last capabilities-bearing
+ * line still wins the side-band decision.
+ */
 function parsePushCommands(body: Buffer): { commands: PushCommand[]; useSideband: boolean; pack: Buffer } | null {
-  let decoded;
+  const commands: PushCommand[] = [];
+  let useSideband = false;
+  let offset = 0;
   try {
-    decoded = decodePktLines(body, { allowTrailing: true });
+    while (offset < body.length) {
+      if (offset + 4 > body.length) throw new Error('pktline-truncated: short header at end of buffer');
+      let length = 0;
+      let valid = true;
+      for (let i = 0; i < 4; i += 1) {
+        const byte = body[offset + i];
+        const digit = byte >= 48 && byte <= 57 ? byte - 48 : byte >= 97 && byte <= 102 ? byte - 87 : -1;
+        if (digit === -1) {
+          valid = false;
+          break;
+        }
+        length = length * 16 + digit;
+      }
+      if (!valid) break; // the pack starts here (or the stream ends): the rest is trailing
+      if (length === 0 || length === 1 || length === 2) {
+        offset += 4; // flush / delim / response-end: no command in it
+        continue;
+      }
+      if (length === 3) throw new Error('pktline-header: length 0003 is not a packet');
+      if (length > PKT_LINE_MAX) throw new Error(`pktline-too-long: ${length} bytes`);
+      if (offset + length > body.length) throw new Error('pktline-truncated: packet overruns the buffer');
+      const payload = body.subarray(offset + 4, offset + length);
+      offset += length;
+      // The command line is the bytes before the first NUL (capabilities follow it), minus one
+      // trailing newline. Capabilities are read first: a malformed line still sets side-band,
+      // exactly as the old code did.
+      const nul = payload.indexOf(0);
+      if (nul !== -1) useSideband = hasSideBand(payload.subarray(nul + 1));
+      let end = nul === -1 ? payload.length : nul;
+      if (end > 0 && payload[end - 1] === 0x0a) end -= 1;
+      // Exactly three space-separated fields (old, new, ref): two spaces, no third.
+      let sp1 = -1;
+      let sp2 = -1;
+      let third = false;
+      for (let i = 0; i < end; i += 1) {
+        if (payload[i] !== 0x20) continue;
+        if (sp1 === -1) sp1 = i;
+        else if (sp2 === -1) sp2 = i;
+        else {
+          third = true;
+          break;
+        }
+      }
+      if (sp1 === -1 || sp2 === -1 || third) continue;
+      const oldOid = payload.subarray(0, sp1).toString('ascii');
+      const newOid = payload.subarray(sp1 + 1, sp2).toString('ascii');
+      const ref = payload.subarray(sp2 + 1, end).toString('utf8');
+      if (!isObjectId(oldOid) || !isObjectId(newOid) || !ref.startsWith('refs/')) continue;
+      commands.push({ oldOid, newOid, ref });
+    }
   } catch {
     return null;
   }
-  const commands: PushCommand[] = [];
-  let useSideband = false;
-  for (const packet of decoded.packets) {
-    if (packet.kind !== 'data') continue;
-    const text = packet.payload.toString('utf8');
-    const nul = text.indexOf('\0');
-    let line = nul === -1 ? text : text.slice(0, nul);
-    if (line.endsWith('\n')) line = line.slice(0, -1);
-    // The only capability receive-pack acts on is side-band-64k: test for that one token instead
-    // of building a full capability map. The last capabilities-bearing line wins, as before.
-    if (nul !== -1) useSideband = hasCapability(text.slice(nul + 1), 'side-band-64k');
-    // Exactly three space-separated fields (old, new, ref): two spaces, no third, no split array.
-    const sp1 = line.indexOf(' ');
-    if (sp1 === -1) continue;
-    const sp2 = line.indexOf(' ', sp1 + 1);
-    if (sp2 === -1 || line.indexOf(' ', sp2 + 1) !== -1) continue;
-    const oldOid = line.slice(0, sp1);
-    const newOid = line.slice(sp1 + 1, sp2);
-    const ref = line.slice(sp2 + 1);
-    if (!isObjectId(oldOid) || !isObjectId(newOid) || !ref.startsWith('refs/')) continue;
-    commands.push({ oldOid, newOid, ref });
-  }
-  return { commands, useSideband, pack: decoded.trailing };
+  return { commands, useSideband, pack: body.subarray(offset) };
 }
 
 /**
@@ -610,8 +681,9 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
     try {
       const read = readPack(pack, { resolveBase: (oid) => store.getObject(repo, oid) });
       // readPack already hashed every object to key its map: store by that id instead of
-      // hashing the bytes a second time in putObject (three SHA-1s saved per push).
-      for (const [oid, object] of read.objects) store.putObjectKnownOid(repo, oid, object.type, object.data);
+      // hashing the bytes a second time in putObject (three SHA-1s saved per push), and
+      // store the reader's object as-is instead of building a second wrapper per object.
+      for (const [oid, object] of read.objects) store.putObjectKnownOid(repo, oid, object);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpack failed';

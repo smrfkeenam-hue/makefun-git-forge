@@ -2,7 +2,7 @@
 // SHA-1 only (the suite speaks object-format sha1 and nothing else). No git binary, no fs: objects
 // live in memory as {type, data} and their id is the SHA-1 of "<type> <len>\0" + data.
 
-import { createHash } from 'node:crypto';
+import { createHash, hash as cryptoHash } from 'node:crypto';
 
 /** The four git object types. */
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
@@ -30,23 +30,45 @@ export function isObjectId(value: string): boolean {
 /** The object header (`"<type> <length>\0"`) for a (type, length) pair, cached: the bench hashes the
  * same shapes over and over (a 1 KiB blob, a small tree, a small commit), so the header Buffer is
  * built once per shape instead of once per hash. The header is only ever fed to a hash update,
- * which never mutates it, so sharing one Buffer per shape is safe. Bounded like the other caches. */
-const HEADER_CACHE = new Map<string, Buffer>();
+ * which never mutates it, so sharing one Buffer per shape is safe. Keyed by (type, length) with
+ * NO string built per lookup: one small Map per type, keyed by the numeric length. Bounded like
+ * the other caches (1024 shapes per type). */
+const HEADER_CACHES: Record<GitObjectType, Map<number, Buffer>> = {
+  commit: new Map(),
+  tree: new Map(),
+  blob: new Map(),
+  tag: new Map(),
+};
 
 /** The cached header Buffer for one object shape. */
 function headerFor(type: GitObjectType, length: number): Buffer {
-  const key = `${type} ${length}`;
-  let header = HEADER_CACHE.get(key);
+  const cache = HEADER_CACHES[type];
+  let header = cache.get(length);
   if (header === undefined) {
     header = Buffer.from(`${type} ${length}\0`, 'ascii');
-    if (HEADER_CACHE.size > 1024) HEADER_CACHE.clear();
-    HEADER_CACHE.set(key, header);
+    if (cache.size > 1024) cache.clear();
+    cache.set(length, header);
   }
   return header;
 }
 
+/**
+ * The largest object hashed through the one-shot path: below it, concatenating the tiny header
+ * onto the data and hashing once (crypto.hash) beats a two-update Hash object — the decisive
+ * ablation (v5b vs v5b-hash, 16 paired rounds x 6,050 ops) measured -3.8 us/op for the one-shot
+ * form, faster in 13 of 16 rounds; above it the copy would cost more than the Hash wrapper
+ * saves, so the streaming form is kept. The 'hex' encoding is passed explicitly: the
+ * no-encoding default differs between Node versions (a Buffer on Node 22, a hex string on
+ * Node 24).
+ */
+const ONE_SHOT_MAX = 8192;
+
 export function hashObject(type: GitObjectType, data: Buffer): string {
-  return createHash('sha1').update(headerFor(type, data.length)).update(data).digest('hex');
+  const header = headerFor(type, data.length);
+  if (data.length <= ONE_SHOT_MAX) {
+    return cryptoHash('sha1', Buffer.concat([header, data]), 'hex');
+  }
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 /** The loose-object bytes: header + content (used only to verify a hash, never written to disk). */
@@ -241,27 +263,57 @@ export function collectReachable(
   return seen;
 }
 
+/** True when the byte is a lowercase-hex digit (the object-id alphabet). */
+function isHexByte(byte: number): boolean {
+  return (byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102);
+}
+
 /**
- * A commit's parent ids, read straight from its bytes: the parent lines sit right after the
- * tree line, so a byte scan finds them without a full parse. Returns null for any shape that
- * is not exactly "tree <oid>\n" followed by "parent <oid>\n" lines — the caller then falls
- * back to the full parse, so a weird-but-valid commit behaves exactly as before.
+ * True when `oid` is one of the commit's immediate parents, read straight from its bytes: the
+ * parent lines sit right after the tree line, so a byte scan finds the answer without a full
+ * parse and without building any oid string. False for every other shape — a malformed commit,
+ * a non-immediate ancestor, a parent list that stops before the match — and the caller falls
+ * back to the full walk, so a weird-but-valid commit behaves exactly as before. The shape rules
+ * mirror the old commitParentOids exactly (a "tree <40hex>\n" line, then "parent <40hex>" lines
+ * of 48 bytes each, stopping at the blank line or the first non-parent line); only the
+ * comparisons moved from toString+isObjectId to raw bytes.
  */
-function commitParentOids(data: Buffer): string[] | null {
-  if (data.length < 46 || data.subarray(0, 5).toString('ascii') !== 'tree ' || data[45] !== 0x0a) return null;
-  if (!isObjectId(data.subarray(5, 45).toString('ascii'))) return null;
-  const parents: string[] = [];
+export function commitHasParent(data: Buffer, oid: string): boolean {
+  if (data.length < 46) return false;
+  if (data[0] !== 0x74 || data[1] !== 0x72 || data[2] !== 0x65 || data[3] !== 0x65 || data[4] !== 0x20) return false; // 'tree '
+  if (data[45] !== 0x0a) return false;
+  for (let i = 5; i < 45; i += 1) if (!isHexByte(data[i])) return false; // the tree oid
   let lineStart = 46;
   while (lineStart < data.length) {
-    if (data[lineStart] === 0x0a) break; // the blank line: the message follows
-    if (data.subarray(lineStart, lineStart + 7).toString('ascii') !== 'parent ') break;
-    if (lineStart + 47 >= data.length) return null;
-    const oid = data.subarray(lineStart + 7, lineStart + 47).toString('ascii');
-    if (!isObjectId(oid)) return null;
-    parents.push(oid);
+    if (data[lineStart] === 0x0a) return false; // the blank line: the message follows
+    if (
+      lineStart + 7 > data.length ||
+      data[lineStart] !== 0x70 || // 'p'
+      data[lineStart + 1] !== 0x61 || // 'a'
+      data[lineStart + 2] !== 0x72 || // 'r'
+      data[lineStart + 3] !== 0x65 || // 'e'
+      data[lineStart + 4] !== 0x6e || // 'n'
+      data[lineStart + 5] !== 0x74 || // 't'
+      data[lineStart + 6] !== 0x20 // ' '
+    ) {
+      return false; // not a parent line: the parent list is over
+    }
+    if (lineStart + 47 >= data.length) return false;
+    let match = true;
+    for (let i = 0; i < 40; i += 1) {
+      const byte = data[lineStart + 7 + i];
+      if (!isHexByte(byte) || byte !== oid.charCodeAt(i)) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+    // A non-matching parent line must still be a well-formed 40-hex oid, or the old code
+    // returned null (fall back): a bad byte anywhere in it means the same here.
+    for (let i = 0; i < 40; i += 1) if (!isHexByte(data[lineStart + 7 + i])) return false;
     lineStart += 48; // "parent " + 40 hex + "\n"
   }
-  return parents;
+  return false;
 }
 
 /** True when `ancestor` is reachable from `tip` (or equals it) — the fast-forward test. */
@@ -270,10 +322,7 @@ export function isAncestor(ancestor: string, tip: string, lookup: ObjectLookup):
   // Fast path: a push's new tip almost always has the old tip as its immediate parent. Only
   // a confirmed immediate parent answers here; every other case falls through to the walk.
   const tipObject = lookup(tip);
-  if (tipObject?.type === 'commit') {
-    const parents = commitParentOids(tipObject.data);
-    if (parents !== null && parents.includes(ancestor)) return true;
-  }
+  if (tipObject?.type === 'commit' && commitHasParent(tipObject.data, ancestor)) return true;
   const seen = new Set<string>();
   const stack = [tip];
   while (stack.length > 0) {

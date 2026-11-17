@@ -7,7 +7,7 @@
 // header + a zlib stream, then a 20-byte SHA-1 trailer over everything before it. Type codes:
 // commit 1, tree 2, blob 3, tag 4, ofs-delta 6, ref-delta 7.
 
-import { createHash, type BinaryLike } from 'node:crypto';
+import { hash as cryptoHash, type BinaryLike } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { hashObject, type GitObject, type GitObjectType } from './git-objects.ts';
 
@@ -35,24 +35,30 @@ export interface PackReadResult {
   readonly checksumOk: boolean;
 }
 
-/** Read the type/size varint header at `offset`: {typeCode, size, nextOffset}. */
-function readEntryHeader(pack: Buffer, offset: number): { typeCode: number; size: number; next: number } {
+/** Read the type/size varint header at `offset` into the reused scratch object `out`
+ * ({typeCode, size, nextOffset}): the caller passes one object for the whole pack, so the hot
+ * path allocates no per-entry header object; the logic is the same varint scan. */
+function readEntryHeaderInto(
+  pack: Buffer,
+  offset: number,
+  out: { typeCode: number; size: number; next: number },
+): void {
   if (offset >= pack.length) throw new Error('pack-truncated: entry header past the end');
   const first = pack[offset];
-  const typeCode = (first >> 4) & 0x07;
-  let size = first & 0x0f;
+  out.typeCode = (first >> 4) & 0x07;
+  out.size = first & 0x0f;
   let shift = 4;
   let at = offset + 1;
   let byte = first;
   while ((byte & 0x80) !== 0) {
     if (at >= pack.length) throw new Error('pack-truncated: size varint past the end');
     byte = pack[at];
-    size |= (byte & 0x7f) << shift;
+    out.size |= (byte & 0x7f) << shift;
     shift += 7;
     at += 1;
     if (shift > 64) throw new Error('pack-corrupt: size varint too long');
   }
-  return { typeCode, size, next: at };
+  out.next = at;
 }
 
 /** Read the OFS_DELTA offset varint at `offset`: {value, nextOffset}. */
@@ -149,15 +155,20 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
   const declaredCount = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
   const trailer = pack.subarray(trailerStart);
-  const computed = createHash('sha1').update(pack.subarray(0, trailerStart) as BinaryLike).digest();
-  if (!computed.equals(trailer)) throw new Error('pack-checksum: the trailer does not match the bytes');
+  // One-shot hash over the single input buffer: no Hash object. The encoding is passed
+  // explicitly ('hex'): the no-encoding default differs between Node versions (a Buffer on
+  // Node 22, a hex string on Node 24), so the comparison is on hex strings on both.
+  const computed = cryptoHash('sha1', pack.subarray(0, trailerStart) as BinaryLike, 'hex');
+  if (computed !== trailer.toString('hex')) throw new Error('pack-checksum: the trailer does not match the bytes');
 
   const entries: PackEntry[] = [];
+  // One scratch header object, reused for every entry (never escapes the loop).
+  const header = { typeCode: 0, size: 0, next: 0 };
   let offset = 12;
   let deltaCount = 0;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
-    const header = readEntryHeader(pack, offset);
+    readEntryHeaderInto(pack, offset, header);
     offset = header.next;
     let delta: PackEntry['delta'] = null;
     if (header.typeCode === 6) {
@@ -355,7 +366,7 @@ export function writePack(objects: readonly GitObject[]): Buffer {
     parts.push(deflateSync(object.data));
   }
   const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body as BinaryLike).digest();
+  const trailer = Buffer.from(cryptoHash('sha1', body as BinaryLike, 'hex'), 'hex');
   return Buffer.concat([body, trailer]);
 }
 
@@ -363,6 +374,6 @@ export function writePack(objects: readonly GitObject[]): Buffer {
 export function verifyPackChecksum(pack: Buffer): { ok: boolean; expected: string; actual: string } {
   if (pack.length < 20) return { ok: false, expected: '', actual: '' };
   const actual = pack.subarray(pack.length - 20).toString('hex');
-  const expected = createHash('sha1').update(pack.subarray(0, pack.length - 20) as BinaryLike).digest('hex');
+  const expected = cryptoHash('sha1', pack.subarray(0, pack.length - 20) as BinaryLike, 'hex');
   return { ok: actual === expected, expected, actual };
 }

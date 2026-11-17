@@ -11,6 +11,7 @@ import {
   buildCommit,
   buildTree,
   collectReachable,
+  commitHasParent,
   countLines,
   diffTrees,
   flattenTree,
@@ -218,10 +219,12 @@ export class Store {
 
   /**
    * Store an object whose id is already known (a pack reader hashed it once already):
-   * the same store-once behaviour as putObject without hashing the bytes a second time.
+   * the same store-once behaviour as putObject without hashing the bytes a second time,
+   * and without building a second {type, data} wrapper — the reader's object is stored
+   * as-is (it is never mutated after this point).
    */
-  putObjectKnownOid(repo: Repo, oid: string, type: GitObjectType, data: Buffer): void {
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  putObjectKnownOid(repo: Repo, oid: string, object: GitObject): void {
+    if (!repo.objects.has(oid)) repo.objects.set(oid, object);
   }
 
   /** Fetch an object, or undefined when absent. */
@@ -721,6 +724,10 @@ export class Store {
   isFastForward(repo: Repo, oldOid: string, newOid: string): boolean {
     if (newOid === ZERO_OID) return true; // a delete always applies
     if (oldOid === ZERO_OID) return true; // a create always applies
+    // Fast path first, without the lookup closure: a push's new tip almost always has the
+    // old tip as its immediate parent, and that answer needs only the tip's own bytes.
+    const tip = repo.objects.get(newOid);
+    if (tip?.type === 'commit' && commitHasParent(tip.data, oldOid)) return true;
     return isAncestor(oldOid, newOid, this.lookup(repo));
   }
 
